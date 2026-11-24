@@ -1,0 +1,12 @@
+{
+  "case_id": "demo-pipeline-01",
+  "output_contract": {
+    "stages": "array",
+    "statistics": "object",
+    "report": "string"
+  },
+  "input_dir": "input",
+  "group_column": "group",
+  "value_column": "score",
+  "alpha": 0.05
+}
