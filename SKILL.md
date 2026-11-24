@@ -11,6 +11,21 @@ description: Use when a research data-analysis case gives raw tabular data and a
 
 不适用：需要人工判断的研究设计、机器学习建模、外部数据库抽取、自由文本综述。
 
+## Quickstart
+
+包内自带一个合成演示案例，可直接跑通：
+
+```powershell
+python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_agent-6aefb2fd\result.json" --work "$env:TEMP\demo_agent-6aefb2fd\work"
+```
+
+- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/input/scores.csv`（8 行、2 组，其中 1 行 score 为空）。
+- 输出：`$env:TEMP\demo_agent-6aefb2fd\result.json` 以及同目录 `report.md`；Welch t 检验 p≈0.0018（A 组 n=3 均值 10.5，B 组 n=4 均值 14.275）。
+- 因空值行在 clean 阶段被丢弃，`status=partial`（`dropped_missing_or_invalid=1`），属预期行为。
+- `output_contract` 的 `stages`、`statistics`、`report` 三个键均非空；同一输入连续两次运行的 result.json 字节一致。
+
+> 数据为合成样本，不代表任何真实实验或官方评测数据。
+
 ## 输入
 
 - `case.json`：`case_id`、`output_contract`；可选 `group_column`、`value_column`、`alpha`、`resume`。
