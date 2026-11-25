@@ -19,10 +19,11 @@ description: Use when a research data-analysis case gives raw tabular data and a
 python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_agent-6aefb2fd\result.json" --work "$env:TEMP\demo_agent-6aefb2fd\work"
 ```
 
-- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/input/scores.csv`（8 行、2 组，其中 1 行 score 为空）。
-- 输出：`$env:TEMP\demo_agent-6aefb2fd\result.json` 以及同目录 `report.md`；Welch t 检验 p≈0.0018（A 组 n=3 均值 10.5，B 组 n=4 均值 14.275）。
-- 因空值行在 clean 阶段被丢弃，`status=partial`（`dropped_missing_or_invalid=1`），属预期行为。
-- `output_contract` 的 `stages`、`statistics`、`report` 三个键均非空；同一输入连续两次运行的 result.json 字节一致。
+- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/input/scores.csv`（12 行、3 组；含 `-999` 哨兵值 1 个、`NA` 1 个、重复行 1 条）。
+- 输出：`$env:TEMP\demo_agent-6aefb2fd\result.json`、同目录 `report.md`、`figure.svg`、`stages/01_ingest.json … 06_report.json`。
+- 清洗丢弃 2 行（`-999`、`NA`）后 10 行参与统计：A n=3 均值 10.5，B n=4 均值 14.2，C n=3 均值 12.867；单因素方差分析 p≈0.000241。
+- 因有丢弃行与重复行，`status=partial`（`dropped_missing_or_invalid=2`），属预期行为。
+- `output_contract` 的 `stages`、`statistics`、`report` 三个键均非空；`cleaned_records`、`quality_issues`、`field_rules`、`answer` 也总是非空；同一输入连续两次运行结果逐字节一致。
 
 > 数据为合成样本，不代表任何真实实验或官方评测数据。
 
@@ -30,28 +31,30 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 
 - `case.json`：`case_id`、`output_contract`；可选 `group_column`、`value_column`、`alpha`、`resume`。
 - 数据：CSV/TSV，自动识别编码与分隔符。
-- 工作区 `/app/work` 保存 `stages/*.json`、`pipeline_state.json`；`/app/output/result.json` 与 `report.md` 为最终产物。
+- 工作区 `--work` 保存 `stages/*.json`、`pipeline_state.json`；同样的 `stages/*.json` 会复制到 `--out` 目录下，使 `artifacts` 中的相对路径都可在输出目录内解析。
 
 ## 处理流程（对应评分维度）
 
 1. **ingest（任务完成度）**：定位数据文件，计算 SHA-256，记录编码、分隔符、行数；无文件则终止并说明。
 2. **profile（正确性）**：逐列类型、缺失、去重后取值数；识别分组列与数值列，记录推断依据。
-3. **clean（正确性）**：仅剔除目标数值缺失或不可解析的行，完全不重复、不填补；输出清洗前后行数与剔除原因分布。
-4. **stats（正确性）**：描述统计（n、均值、SD、中位数、Q1/Q3）；两组 Welch t 检验，多组单因素方差分析；样本量不足或方差为零时不出 p 值；效应量给 Cohen d 或 eta²。
-5. **figure_spec（完整性）**：输出图型、编码、轴标题、单位、图注骨架与配色，不伪造 PNG。
+3. **clean（正确性）**：先把内置 `MISSING` 集合与 `case.missing_tokens` 声明的缺失标记（`-999`、`-9999`、`NA`、`ND`、`<LOD` 等）统一判为缺失，再解析数值；逐行记录被丢弃行的行号、列名、原始值与规则，写入 `stages/03_clean.json` 与 `report.md` 的 Cleaning 段；不填补、不删重复行（重复行计数但保留）。
+4. **stats（正确性）**：仅用清洗后的值计算描述统计（n、均值、SD、中位数、Q1/Q3）；两组 Welch t 检验，多组单因素方差分析；任一组 n<2 时明确记录 `low_n_groups` 并降级为 `partial`；样本量不足或方差为零时不出 p 值。
+5. **figure（完整性）**：用标准库手写确定性 SVG 柱状图 `figure.svg`（组均值 ±1 SD 误差棒、带单位的轴标题、标题与图注），`artifacts.figure="figure.svg"`，并记录作图所用聚合值。
 6. **report（可读性）**：Markdown 报告中的每个数字都来自 `stages/*.json`，不手写与产物不一致的结论；附限制与复跑命令。
-7. **断点与失败传播（可靠体验）**：每阶段写 `status`、`input_hash`、`output_hash`；上游失败则下游标 `blocked`，不静默继续；相同输入复跑时已完成阶段标 `skipped_resume`。
+7. **断点与失败传播（可靠体验）**：每阶段写 `status` 与 `inputs`/`outputs`，产物哈希记入 `evidence.hashes`；上游失败则下游标 `blocked`，不静默继续；相同输入复跑时已完成阶段标 `skipped_resume`。
 
 ## 输出契约
 
 | 字段 | 含义 |
 |-|-|
 | `case_id` | 与输入一致 |
-| `output_contract` 各字段 | 命中别名时填真实值，否则 `null` + `contract_notes` |
+| `output_contract` 各字段 | 命中别名/关键字时填真实值，否则 `null` + `contract_extras[field]` 说明 |
+| `answer` | 非空串：数据规模、清洗动作、各组 n 与均值、检验结果 |
+| `cleaned_records` / `quality_issues` / `field_rules` | 清洗记录引用（路径+行数+列摘要）/ 质量问题（哨兵丢弃、离群、重复）/ 逐列规则与推断类型 |
 | `status` | `success` / `partial` / `insufficient_input` / `failed` |
 | `result` | `stages`、`artifacts`、`dataset`、`statistics`、`report`、`checks` |
 | `evidence` | 输入哈希、阶段产物路径与哈希、规则版本 |
-| `uncertainty` | 自动列推断、未做多重比较校正、无位图 |
+| `uncertainty` | 自动列推断、未做多重比较校正、仅有 SVG 无位图 |
 | `errors` / `stats` | 真实错误与计数 |
 
 ## 异常处理表
@@ -62,6 +65,7 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 | 无数据文件 | ingest 失败，下游 blocked | `insufficient_input` |
 | 缺少分组列 | 仅单变量描述，标记降级 | `partial` |
 | 组样本量 < 3 | 不检验，报告描述统计 | `partial` |
+| 任一组 n < 2 | 该组无 SD、不推断，写入 `low_n_groups` | `partial` |
 | 清洗后无有效行 | 终止后续统计 | `insufficient_input` |
 | 阶段写盘失败 | 记录错误并停止下游 | `failed` |
 | 相同输入复跑 | 已完成阶段 `skipped_resume` | `success` |
@@ -70,7 +74,7 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 
 - 自动列推断可能误选 ID 或时间列，需在 `dataset.inference` 复核。
 - 只实现两组 Welch t 与多组单因素方差分析，不做非参数检验、配对检验或多重比较校正。
-- 图表阶段只产出规格，不生成位图；报告为 Markdown，不含期刊排版。
+- 图表为手写 SVG 柱状图（均值 ±1 SD），不做统计图形建模，也不导出 PNG/TIFF；报告为 Markdown，不含期刊排版。
 
 ## 最小调用示例（示例，非官方案例结果）
 
