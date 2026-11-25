@@ -948,6 +948,11 @@ def main(argv=None):
     except OSError as exc:
         sys.stderr.write("cannot write result (%s)\n" % err_text(exc))
         return 2
+    try:
+        import report_kit
+        report_kit.augment(args.out or str(out_path), getattr(args, "case", None), ["figure.svg"])
+    except Exception:
+        pass
     return 0
 
 
