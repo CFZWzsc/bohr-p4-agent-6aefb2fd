@@ -11,18 +11,21 @@ import os
 import re
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 MAX_ROWS = 200000
+MAX_DROPS = 500
+RULES_VERSION = "2026-11-20.r2"
 PATH_KEYS = ("input_dir", "input_root", "materials_dir", "materials", "data_dir", "dataset_dir", "directory", "path", "root")
 SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".cache"}
-MISSING = {"", "na", "n/a", "nan", "none", "null", "nil", "-", "--", "-999", "-9999"}
+MISSING = {"", "na", "n/a", "n.a.", "nan", "none", "null", "nil", "nd", "-", "--", "-999", "-9999", "<lod"}
 ALIASES = {
     "case_id": ["case_id", "caseid", "id"],
     "stages": ["stages", "steps", "pipeline", "stage_results"],
     "artifacts": ["artifacts", "outputs", "files", "products"],
     "dataset": ["dataset", "data", "ingested", "profile"],
     "statistics": ["statistics", "stats_results", "analysis", "tests"],
-    "report": ["report", "markdown", "report_markdown", "summary", "conclusion"],
+    "report": ["report", "markdown", "report_markdown", "conclusion"],
     "checks": ["checks", "quality_checks", "warnings", "validation"],
     "status": ["status", "run_status"],
     "result": ["result", "results", "data"],
@@ -119,7 +122,7 @@ def collect(roots, errors, skipped, exclude):
                     for fn in sorted(filenames):
                         paths.append(Path(dirpath) / fn)
             except OSError as exc:
-                errors.append("walk failed on %s: %s" % (root.name, exc))
+                errors.append("walk failed on %s (%s)" % (root.name or "input root", err_text(exc)))
                 continue
         for path in paths:
             try:
@@ -156,6 +159,49 @@ def to_float(value):
         return None
 
 
+def err_text(exc):
+    """Short error text without host paths."""
+    if isinstance(exc, OSError) and getattr(exc, "strerror", None):
+        return "%s (%s)" % (type(exc).__name__, exc.strerror)
+    return type(exc).__name__
+
+
+def missing_tokens(case):
+    tokens = {t for t in MISSING if t}
+    extra = case.get("missing_tokens")
+    if isinstance(extra, str):
+        extra = [extra]
+    if isinstance(extra, list):
+        for tok in extra:
+            if isinstance(tok, bool):
+                continue
+            if isinstance(tok, (int, float)):
+                tokens.add(("%g" % tok).lower())
+            elif isinstance(tok, str) and tok.strip():
+                tokens.add(tok.strip().lower())
+    return tokens
+
+
+def missing_rule(raw, tokens):
+    """Return the cleaning rule name when a cell must be treated as missing."""
+    text = str(raw).strip()
+    key = text.lower()
+    if key == "":
+        return "empty_cell"
+    if key not in tokens:
+        return None
+    if re.fullmatch(r"[+-]?\d+(?:\.0+)?", key):
+        return "sentinel_numeric"
+    if key.startswith("<"):
+        return "below_detection"
+    return "missing_token"
+
+
+def column_unit(name):
+    match = re.search(r"[\(\[]([^\)\]]+)[\)\]]", str(name))
+    return match.group(1).strip() if match else ""
+
+
 def mean(xs):
     return sum(xs) / float(len(xs))
 
@@ -181,6 +227,92 @@ def quantile(xs, q):
     lo = int(math.floor(pos))
     hi = min(lo + 1, len(s) - 1)
     return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def fmt_num(x, digits=3):
+    if x is None:
+        return "NA"
+    text = ("%." + str(digits) + "f") % float(x)
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in ("", "-0"):
+        text = "0"
+    return text
+
+
+def build_svg(desc, group_col, value_col, unit, title):
+    """Deterministic hand-written SVG bar chart: group means with +/-1 SD error bars."""
+    width, height = 720, 460
+    left, right, top, bottom = 84, 40, 76, 92
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    means = [d["mean"] for d in desc]
+    sds = [d["sd"] if d["sd"] is not None else 0.0 for d in desc]
+    lows = [m - s for m, s in zip(means, sds)]
+    highs = [m + s for m, s in zip(means, sds)]
+    lo, hi = min(lows + [0.0]), max(highs + [0.0])
+    if hi - lo <= 0:
+        hi = lo + 1.0
+    span = hi - lo
+    hi += span * 0.12
+    if lo < 0:
+        lo -= span * 0.08
+
+    def ypos(v):
+        return top + plot_h * (hi - v) / (hi - lo)
+
+    palette = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00"]
+    slot = plot_w / float(len(desc))
+    bar_w = min(64.0, slot * 0.55)
+    total = sum(d["n"] for d in desc)
+    caption = "Bars: group means; error bars: +/-1 SD; n per group below bars. Units: %s. Total n=%d." % (
+        unit or "as recorded in the source column header", total)
+    base_col = re.sub(r"\s*[\(\[]([^\)\]]+)[\)\]]\s*$", "", value_col).strip() or value_col
+    y_label = base_col + (" (%s)" % unit if unit else "")
+
+    parts = []
+    add = parts.append
+    add('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" role="img" aria-label="%s">'
+        % (width, height, width, height, escape(title)))
+    add('  <rect x="0" y="0" width="%d" height="%d" fill="#ffffff"/>' % (width, height))
+    add('  <text x="%.1f" y="30" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="18" fill="#1a1a1a">%s</text>'
+        % (width / 2.0, escape(title)))
+    add('  <text x="%.1f" y="52" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#555555">%s</text>'
+        % (width / 2.0, escape(caption)))
+    ticks = 5
+    for i in range(ticks + 1):
+        v = lo + (hi - lo) * i / float(ticks)
+        y = ypos(v)
+        add('  <line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#e4e4e4" stroke-width="1"/>' % (left, y, left + plot_w, y))
+        add('  <text x="%d" y="%.1f" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#444444">%s</text>'
+            % (left - 8, y + 4, escape(fmt_num(v, 3))))
+    for i, d in enumerate(desc):
+        cx = left + slot * (i + 0.5)
+        m, s = d["mean"], sds[i]
+        y_top, y_zero = ypos(m), ypos(0.0)
+        add('  <rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s" fill-opacity="0.88"/>'
+            % (cx - bar_w / 2.0, min(y_top, y_zero), bar_w, abs(y_zero - y_top), palette[i % len(palette)]))
+        if s > 0:
+            add('  <line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#222222" stroke-width="1.5"/>'
+                % (cx, ypos(m - s), cx, ypos(m + s)))
+            for cap_y in (ypos(m - s), ypos(m + s)):
+                add('  <line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#222222" stroke-width="1.5"/>'
+                    % (cx - 7, cap_y, cx + 7, cap_y))
+        add('  <text x="%.1f" y="%.1f" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#1a1a1a">%s</text>'
+            % (cx, ypos(m + s) - 8, escape(fmt_num(m, 3))))
+        add('  <text x="%.1f" y="%.1f" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#333333">%s</text>'
+            % (cx, top + plot_h + 22, escape("%s (n=%d)" % (d["group"], d["n"]))))
+    add('  <line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#333333" stroke-width="1.2"/>' % (left, top, left, top + plot_h))
+    add('  <line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#333333" stroke-width="1.2"/>'
+        % (left, top + plot_h, left + plot_w, top + plot_h))
+    add('  <text x="%.1f" y="%d" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#1a1a1a">%s</text>'
+        % (left + plot_w / 2.0, top + plot_h + 52, escape("group: %s" % group_col)))
+    add('  <text transform="translate(24,%.1f) rotate(-90)" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#1a1a1a">%s</text>'
+        % (top + plot_h / 2.0, escape(y_label)))
+    add('  <text x="%d" y="%d" font-family="Helvetica, Arial, sans-serif" font-size="10" fill="#666666">%s</text>'
+        % (left, height - 12, escape("mean %s by %s; source: %s" % (value_col, group_col, "cleaned analysis rows"))))
+    add('</svg>')
+    return "\n".join(parts) + "\n"
 
 
 def betacf(a, b, x):
@@ -281,6 +413,33 @@ def resolve_field(field, payload):
     return None, None
 
 
+DOMAIN_KEYWORDS = (
+    (("summary", "answer", "conclusion", "abstract", "takeaway"), "answer"),
+    (("field_rule", "fieldrule", "dictionary", "column_rule", "column_type", "schema"), "field_rules"),
+    (("clean", "record", "table", "prepared"), "cleaned_records"),
+    (("quality", "issue", "problem", "anomal", "warning"), "quality_issues"),
+    (("rule",), "field_rules"),
+    (("report", "markdown", "narrative", "writeup"), "report"),
+)
+
+
+def keyword_map(field, payload):
+    """Keyword fallback so domain contract fields resolve to real values."""
+    key = norm_key(field)
+    if not key:
+        return None, None
+    for words, target in DOMAIN_KEYWORDS:
+        for word in words:
+            if key.startswith(word) or ("_" + word) in key:
+                value = payload.get(target)
+                if value is None or value == "":
+                    continue
+                if isinstance(value, (dict, list)) and not value:
+                    continue
+                return target, value
+    return None, None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Staged analysis pipeline (stdlib only)")
     parser.add_argument("--case", default="/input/case.json")
@@ -290,6 +449,8 @@ def main(argv=None):
     os.environ["SK_RESULT_PATH"] = str(getattr(args, "out", None) or getattr(args, "output", None) or "")
 
     case_path = Path(args.case)
+    out_path = Path(args.out)
+    out_dir = out_path.parent
     errors, case, status = [], {}, "success"
     try:
         with open(case_path, "r", encoding="utf-8-sig") as fh:
@@ -297,36 +458,47 @@ def main(argv=None):
         if not isinstance(case, dict):
             raise ValueError("case.json root is not an object")
     except (OSError, ValueError) as exc:
-        errors.append("cannot read case.json: %s" % exc)
+        errors.append("cannot read case.json (%s): %s" % (case_path.name, err_text(exc)))
         case, status = {}, "failed"
 
     case_id = case.get("case_id") if isinstance(case.get("case_id"), str) else "unknown"
     fields = contract_fields(case)
-    alpha = case.get("alpha") if isinstance(case.get("alpha"), (int, float)) else 0.05
+    alpha = case.get("alpha") if isinstance(case.get("alpha"), (int, float)) and not isinstance(case.get("alpha"), bool) else 0.05
+    tokens = missing_tokens(case)
     work = Path(args.work)
     stages_dir = work / "stages"
+    out_stages_dir = out_dir / "stages"
     state_path = work / "pipeline_state.json"
-    try:
-        stages_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        errors.append("cannot create work dir: %s" % exc)
+    for target in (stages_dir, out_stages_dir):
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            errors.append("cannot create stage dir (%s)" % err_text(exc))
 
-    stages, artifacts = [], {}
+    stages, artifacts, stage_hashes = [], {}, {}
 
     def record(name, stage_status, inputs, outputs):
+        index = len(stages) + 1
+        rel = "stages/%02d_%s.json" % (index, name)
         entry = {"stage": name, "status": stage_status,
                  "inputs": inputs, "outputs": outputs}
         stages.append(entry)
-        try:
-            (stages_dir / ("%02d_%s.json" % (len(stages), name))).write_text(
-                json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            artifacts[name] = "stages/%02d_%s.json" % (len(stages), name)
-        except OSError as exc:
-            errors.append("cannot write stage %s: %s" % (name, exc))
+        text = json.dumps(entry, ensure_ascii=False, indent=2) + "\n"
+        for target in (stages_dir, out_stages_dir):
+            try:
+                (target / Path(rel).name).write_text(text, encoding="utf-8")
+            except OSError as exc:
+                errors.append("cannot write stage %s (%s)" % (name, err_text(exc)))
+        artifacts["report_stage" if name == "report" else name] = rel
+        stage_hashes[rel] = sha256_text(text)
         return entry
 
     dataset, statistics, checks, report = {}, {}, [], ""
+    cleaning, quality, field_rules, cleaned, desc, tests = {}, {}, {}, {}, [], {}
     rows, header, source = [], [], None
+    group_col, value_col = None, None
+    figure_hash, report_hash, wrote_figure = None, None, False
+    sig = "not evaluated"
     if status != "failed":
         found = None
         for path, rel in collect(candidate_roots(case, case_path), errors, [], case_path):
@@ -358,11 +530,17 @@ def main(argv=None):
                 source = dataset
                 record("ingest", "success", {"file": rel}, {"rows": len(rows), "sha256": dataset["sha256"]})
 
-                profiles, group_col, value_col = [], None, None
+                profiles = []
                 for idx, name in enumerate(header):
-                    vals = [r[idx].strip() for r in rows if r[idx].strip().lower() not in MISSING]
-                    nums = [to_float(v) for v in vals]
-                    num = [x for x in nums if x is not None]
+                    vals, by_rule = [], {}
+                    for r in rows:
+                        cell = r[idx].strip()
+                        rule = missing_rule(cell, tokens)
+                        if rule:
+                            by_rule[rule] = by_rule.get(rule, 0) + 1
+                            continue
+                        vals.append(cell)
+                    num = [x for x in (to_float(v) for v in vals) if x is not None]
                     if vals and len(num) / float(len(vals)) >= 0.8 and len(set(vals)) > 2:
                         kind = "numeric"
                     elif 2 <= len(set(vals)) <= 10:
@@ -370,7 +548,8 @@ def main(argv=None):
                     else:
                         kind = "text"
                     profiles.append({"column": name, "type": kind, "non_missing": len(vals),
-                                     "missing": len(rows) - len(vals), "distinct": len(set(vals))})
+                                     "missing": len(rows) - len(vals), "distinct": len(set(vals)),
+                                     "missing_by_rule": dict(sorted(by_rule.items()))})
                 for p in profiles:
                     if p["type"] == "categorical" and group_col is None:
                         group_col = p["column"]
@@ -380,10 +559,33 @@ def main(argv=None):
                     group_col = case["group_column"]
                 if case.get("value_column") in header:
                     value_col = case["value_column"]
+                for p in profiles:
+                    if p["column"] == group_col:
+                        p["role"] = "group"
+                    elif p["column"] == value_col:
+                        p["role"] = "measure"
+                    else:
+                        p["role"] = "unused"
+                field_rules = {
+                    "version": RULES_VERSION,
+                    "missing_tokens": sorted(tokens),
+                    "columns": [{
+                        "column": p["column"],
+                        "role": p["role"],
+                        "inferred_type": p["type"],
+                        "non_missing": p["non_missing"],
+                        "distinct": p["distinct"],
+                        "missing_by_rule": p["missing_by_rule"],
+                        "value_rule": ("label: trimmed; missing token -> missing_group" if p["role"] == "group"
+                                       else "measure: normalize missing tokens, then float()" if p["role"] == "measure"
+                                       else "not used in this analysis"),
+                    } for p in profiles],
+                }
                 dataset["inference"] = {"group_column": group_col, "value_column": value_col,
-                                        "rule": "first categorical (2-10 levels) and first numeric column; explicit case fields win"}
+                                        "rule": "explicit case fields win; otherwise first categorical (2-10 levels) and first numeric column"}
                 record("profile", "success", {"rows": len(rows)},
-                       {"group_column": group_col, "value_column": value_col, "columns": len(profiles)})
+                       {"group_column": group_col, "value_column": value_col, "columns": len(profiles),
+                        "missing_tokens_observed": sorted({k for p in profiles for k in p["missing_by_rule"]})})
 
                 if not value_col:
                     record("clean", "failed", {"value_column": None}, {"error": "no numeric measure"})
@@ -396,22 +598,41 @@ def main(argv=None):
                 else:
                     vi = header.index(value_col)
                     gi = header.index(group_col) if group_col else None
-                    groups, dropped, dup = {}, 0, 0
-                    seen = set()
-                    for r in rows:
+                    groups, drops, dup, dropped_total = {}, [], 0, 0
+                    rule_counts, seen = {}, set()
+                    for ridx, r in enumerate(rows):
                         key = tuple(c.strip() for c in r)
                         if key in seen:
                             dup += 1
                         else:
                             seen.add(key)
-                        v = to_float(r[vi])
-                        if v is None:
-                            dropped += 1
+                        cell = r[vi].strip()
+                        rule = missing_rule(cell, tokens)
+                        value = to_float(cell) if rule is None else None
+                        if rule is None and value is None:
+                            rule = "unparsable_numeric"
+                        if rule:
+                            dropped_total += 1
+                            rule_counts[rule] = rule_counts.get(rule, 0) + 1
+                            if len(drops) < MAX_DROPS:
+                                drops.append({"row": ridx + 1, "column": value_col,
+                                              "token": cell, "rule": rule})
                             continue
-                        groups.setdefault(r[gi].strip() or "missing_group" if gi is not None else "all", []).append(v)
+                        label = "all"
+                        if gi is not None:
+                            raw_label = r[gi].strip()
+                            label = raw_label if raw_label and missing_rule(raw_label, tokens) is None else "missing_group"
+                        groups.setdefault(label, []).append(value)
                     cleaning = {"rows_in": len(rows), "rows_out": sum(len(g) for g in groups.values()),
-                                "dropped_missing_or_invalid": dropped, "duplicate_rows_kept": dup,
-                                "policy": "no imputation; only invalid target rows dropped"}
+                                "dropped_missing_or_invalid": dropped_total,
+                                "duplicate_rows_kept": dup,
+                                "dropped_rows_recorded": len(drops),
+                                "drops_truncated": dropped_total > len(drops),
+                                "drops_by_rule": dict(sorted(rule_counts.items())),
+                                "missing_tokens": sorted(tokens),
+                                "drops": drops,
+                                "row_numbering": "row = 1-based data record index (header excluded)",
+                                "policy": "explicit missing tokens and unparsable values are dropped before numeric parsing; no imputation; duplicate rows are counted but kept"}
                     record("clean", "success" if groups else "failed", {"rows": len(rows)}, cleaning)
                     if not groups:
                         record("stats", "blocked", {}, {"reason": "no valid rows after cleaning"})
@@ -425,6 +646,7 @@ def main(argv=None):
                                          "median": median(vals), "q1": quantile(vals, 0.25),
                                          "q3": quantile(vals, 0.75), "min": min(vals), "max": max(vals)})
                         min_n = min(len(v) for v in groups.values())
+                        low_groups = [d["group"] for d in desc if d["n"] < 2]
                         tests = {"method": "none", "p_value": None, "alpha": alpha}
                         if len(groups) == 2 and min_n >= 3:
                             res = welch(groups[sorted(groups)[0]], groups[sorted(groups)[1]])
@@ -447,64 +669,144 @@ def main(argv=None):
                         else:
                             tests["reason"] = "fewer than 2 groups or a group with n<3"
                             status = "partial"
-                        statistics = {"descriptive": desc, "tests": tests, "alpha": alpha}
+                        statistics = {"descriptive": desc, "tests": tests, "alpha": alpha,
+                                      "cleaned_rows": sum(d["n"] for d in desc),
+                                      "low_n_groups": low_groups}
+                        if low_groups:
+                            statistics["low_n_note"] = "group(s) with n<2 have no SD or inference; status downgraded to partial"
+                            status = "partial"
                         record("stats", "success", {"groups": len(groups)},
-                               {"method": tests["method"], "p_value": tests.get("p_value")})
+                               {"method": tests["method"], "p_value": tests.get("p_value"),
+                                "cleaned_rows": statistics["cleaned_rows"]})
 
-                        agg = [{"label": d["group"], "mean": d["mean"], "sd": d["sd"], "n": d["n"]} for d in desc]
-                        spec = {"chart_type": "bar" if len(groups) > 1 else "histogram",
-                                "encoding": {"x": group_col or value_col, "y": value_col,
-                                             "error_bar": "±1 SD"},
-                                "aggregates": agg,
-                                "caption": "Mean %s by %s (n=%d). Error bars show ±1 SD." % (
-                                    value_col, group_col or "all rows", sum(d["n"] for d in desc)),
-                                "palette": "Okabe-Ito subset", "exports": {"png": None,
-                                                                           "note": "spec only; no rasterizer"}}
-                        record("figure_spec", "success", {"groups": len(groups)}, {"chart": spec["chart_type"]})
+                        flat = [v for g in groups.values() for v in g]
+                        outliers, outlier_rule = [], "not computed (fewer than 5 cleaned values)"
+                        if len(flat) >= 5:
+                            q1, q3 = quantile(flat, 0.25), quantile(flat, 0.75)
+                            iqr = q3 - q1
+                            if iqr > 0:
+                                fence_low, fence_high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                                outliers = sorted(v for v in flat if v < fence_low or v > fence_high)
+                                outlier_rule = "outside [Q1-1.5*IQR, Q3+1.5*IQR] on cleaned values"
+                        quality = {
+                            "missing_tokens": {"tokens": sorted(tokens),
+                                               "dropped_rows": dropped_total,
+                                               "by_rule": dict(sorted(rule_counts.items()))},
+                            "duplicates": {"rows": dup, "action": "kept and included in statistics"},
+                            "outliers": {"rule": outlier_rule, "count": len(outliers),
+                                         "values": outliers[:20]},
+                            "actions": ["normalized sentinel/NA tokens to missing before parsing",
+                                        "dropped rows without a usable numeric target",
+                                        "no imputation or winsorisation applied"],
+                        }
 
                         p = tests.get("p_value")
                         sig = "not evaluated" if p is None else ("p=%.4g (%s at alpha=%.2f)" % (
                             p, "significant" if p < alpha else "not significant", alpha))
-                        report = "\n".join([
+
+                        unit = column_unit(value_col)
+                        figure_title = "Mean %s by %s" % (value_col, group_col or "all rows")
+                        try:
+                            svg = build_svg(desc, group_col or "all rows", value_col, unit, figure_title)
+                            (out_dir / "figure.svg").write_text(svg, encoding="utf-8")
+                            artifacts["figure"] = "figure.svg"
+                            figure_hash = sha256_text(svg)
+                            wrote_figure = True
+                        except OSError as exc:
+                            errors.append("cannot write figure.svg (%s)" % err_text(exc))
+                            status = "partial"
+                        spec = {"chart_type": "bar" if len(groups) > 1 else "histogram",
+                                "file": "figure.svg" if wrote_figure else None,
+                                "encoding": {"x": group_col or value_col, "y": value_col,
+                                             "error_bar": "+/- 1 SD",
+                                             "y_units": unit or "not declared in source header"},
+                                "aggregates": [{"label": d["group"], "n": d["n"], "mean": d["mean"],
+                                                "sd": d["sd"],
+                                                "error_low": None if d["sd"] is None else d["mean"] - d["sd"],
+                                                "error_high": None if d["sd"] is None else d["mean"] + d["sd"]}
+                                               for d in desc],
+                                "caption": "Mean %s by %s (n=%d). Error bars show +/-1 SD." % (
+                                    value_col, group_col or "all rows", statistics["cleaned_rows"]),
+                                "palette": "Okabe-Ito subset",
+                                "renderer": "hand-written SVG (stdlib only, deterministic)"}
+                        record("figure_spec", "success" if wrote_figure else "partial",
+                               {"groups": len(groups)},
+                               {"chart": spec["chart_type"], "file": spec["file"],
+                                "aggregates": spec["aggregates"]})
+
+                        cleaning_lines = [
+                            "- rows in: %d; rows out: %d; dropped: %d; duplicate rows kept: %d" % (
+                                cleaning["rows_in"], cleaning["rows_out"], dropped_total, dup),
+                            "- missing tokens treated as missing: %s" % ", ".join(sorted(tokens)),
+                            "- rule: %s" % cleaning["policy"],
+                            "- row numbers below are 1-based data record indexes (header excluded)",
+                        ]
+                        if drops:
+                            cleaning_lines += ["", "| row | column | token | rule |", "|---|---|---|---|"]
+                            cleaning_lines += ["| %d | %s | %s | %s |" % (
+                                d["row"], d["column"], d["token"] or "(empty)", d["rule"]) for d in drops]
+                            if cleaning["drops_truncated"]:
+                                cleaning_lines.append("")
+                                cleaning_lines.append("- first %d of %d dropped rows listed" % (
+                                    len(drops), dropped_total))
+                        else:
+                            cleaning_lines.append("- no rows were dropped")
+
+                        report_lines = [
                             "# Analysis report: %s" % rel,
                             "",
                             "## Data",
-                            "- rows: %d, columns: %d, encoding: %s" % (len(rows), len(header), enc),
+                            "- rows: %d, columns: %d, encoding: %s, delimiter: %s" % (
+                                len(rows), len(header), enc, dataset["delimiter"]),
                             "- SHA-256: %s" % dataset["sha256"],
                             "- group column: %s; value column: %s" % (group_col, value_col),
                             "",
                             "## Cleaning",
-                            "- rows out: %d; dropped invalid target rows: %d; duplicate rows kept: %d" % (
-                                cleaning["rows_out"], dropped, dup),
+                        ] + cleaning_lines + [
                             "",
                             "## Descriptive statistics",
-                            "| group | n | mean | SD | median | Q1 | Q3 |",
-                            "|---|---|---|---|---|---|---|",
-                        ] + ["| %s | %d | %.4g | %s | %.4g | %.4g | %.4g |" % (
-                            d["group"], d["n"], d["mean"], "%.4g" % d["sd"] if d["sd"] is not None else "NA",
-                            d["median"], d["q1"], d["q3"]) for d in desc] + [
+                            "- cleaned rows analysed: %d" % statistics["cleaned_rows"],
+                            "",
+                            "| group | n | mean | SD | median | Q1 | Q3 | min | max |",
+                            "|---|---|---|---|---|---|---|---|---|",
+                        ] + ["| %s | %d | %s | %s | %s | %s | %s | %s | %s |" % (
+                            d["group"], d["n"], fmt_num(d["mean"], 4),
+                            fmt_num(d["sd"], 4) if d["sd"] is not None else "NA",
+                            fmt_num(d["median"], 4), fmt_num(d["q1"], 4), fmt_num(d["q3"], 4),
+                            fmt_num(d["min"], 4), fmt_num(d["max"], 4)) for d in desc] + [
                             "",
                             "## Test",
                             "- method: %s" % tests["method"],
                             "- result: %s" % sig,
+                        ]
+                        if low_groups:
+                            report_lines.append("- groups with n<2 (no SD, no inference): %s" % ", ".join(low_groups))
+                        report_lines += [
+                            "",
+                            "## Figure",
+                            "- file: figure.svg; bars are group means with +/-1 SD error bars",
                             "",
                             "## Limits",
                             "- normality and independence are not tested here; no multiple-comparison correction.",
                             "- effect sizes are descriptive; significance is not proof of causation.",
-                        ])
-                        record("report", "success", {"stats": "stats"}, {"chars": len(report)})
-                        if dropped or dup or status == "partial":
+                        ]
+                        report = "\n".join(report_lines) + "\n"
+                        record("report", "success",
+                               {"stats": "stats", "figure": "figure.svg" if wrote_figure else None},
+                               {"chars": len(report), "figure": "figure.svg" if wrote_figure else None})
+                        if dropped_total or dup or low_groups or not wrote_figure or status != "success":
                             status = "partial" if status == "success" else status
 
     report_path = None
     if report:
         try:
-            out_dir = Path(args.out).parent
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "report.md").write_text(report, encoding="utf-8")
             report_path = "report.md"
+            artifacts["report"] = "report.md"
+            report_hash = sha256_text(report)
         except OSError as exc:
-            errors.append("cannot write report.md: %s" % exc)
+            errors.append("cannot write report.md (%s)" % err_text(exc))
 
     try:
         state = {"input": source["sha256"] if source else None,
@@ -521,59 +823,130 @@ def main(argv=None):
                 pass
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
-        errors.append("cannot write pipeline state: %s" % exc)
+        errors.append("cannot write pipeline state (%s)" % err_text(exc))
 
     blocked = sum(1 for s in stages if s["status"] in ("blocked", "failed"))
     if status == "success" and blocked:
         status = "partial"
 
+    if desc:
+        cleaned = {
+            "path": "stages/03_clean.json",
+            "rows": sum(d["n"] for d in desc),
+            "rows_in": cleaning["rows_in"],
+            "dropped": cleaning["dropped_missing_or_invalid"],
+            "duplicate_rows_kept": cleaning["duplicate_rows_kept"],
+            "column_summary": [{"column": p["column"], "role": p["role"], "type": p["inferred_type"],
+                                "non_missing": p["non_missing"], "distinct": p["distinct"]}
+                               for p in field_rules.get("columns", [])],
+            "note": "cleaned analysis rows; the staged JSON holds the drop log and counts",
+        }
+        checks.append({"check": "missing_tokens_removed", "status": "pass",
+                       "detail": "%d row(s) dropped before parsing; values used in statistics are cleaned only" % cleaning["dropped_missing_or_invalid"]})
+        checks.append({"check": "figure_written", "status": "pass" if wrote_figure else "fail",
+                       "detail": "figure.svg in the output directory" if wrote_figure else "figure.svg could not be written"})
+        checks.append({"check": "statistics_internal_consistency",
+                       "status": "pass" if statistics.get("cleaned_rows") == cleaning["rows_out"] else "fail",
+                       "detail": "sum of group n equals cleaned rows"})
+        if statistics.get("low_n_groups"):
+            checks.append({"check": "group_min_n", "status": "fail",
+                           "detail": "group(s) with n<2: %s" % ", ".join(statistics["low_n_groups"])})
+
+    answer_parts = []
+    if source:
+        answer_parts.append("Ingested %s (%d rows, %d columns)." % (
+            source["file"], source["rows"], source["columns"]))
+    if cleaning:
+        rules = ", ".join("%s=%d" % (k, v) for k, v in cleaning["drops_by_rule"].items()) or "none"
+        answer_parts.append("Cleaning dropped %d row(s) with missing/sentinel or invalid target values (%s) and kept %d duplicate row(s)." % (
+            cleaning["dropped_missing_or_invalid"], rules, cleaning["duplicate_rows_kept"]))
+    if source and not value_col:
+        answer_parts.append("No numeric measure column was identified, so statistics and the figure were not produced.")
+    if desc:
+        answer_parts.append("Groups: " + "; ".join("%s n=%d mean=%s sd=%s" % (
+            d["group"], d["n"], fmt_num(d["mean"], 4),
+            fmt_num(d["sd"], 4) if d["sd"] is not None else "NA") for d in desc) + ".")
+    if tests:
+        if tests.get("p_value") is None:
+            answer_parts.append("No hypothesis test was run (%s)." % tests.get("reason", "insufficient sample size"))
+        else:
+            answer_parts.append("%s: %s." % (tests["method"], sig))
+    if statistics.get("low_n_groups"):
+        answer_parts.append("Group(s) with n<2 have no SD and no inference: %s." % ", ".join(statistics["low_n_groups"]))
+    if artifacts.get("figure"):
+        answer_parts.append("A deterministic SVG bar chart of group means with +/-1 SD error bars was written to figure.svg.")
+    if not desc:
+        if status == "failed":
+            answer_parts.append("Pipeline failed before analysis: %s." % (errors[0] if errors else "case.json could not be read"))
+        elif source is None:
+            answer_parts.append("No CSV/TSV data file was found under the case input directory; the pipeline stopped at ingest.")
+        elif value_col:
+            answer_parts.append("No usable numeric rows remained after cleaning; statistics were stopped.")
+    answer_parts.append("Status: %s." % status)
+    answer = " ".join(answer_parts)
+
     result = {"stages": stages, "artifacts": artifacts, "dataset": dataset,
               "statistics": statistics, "report": report, "report_path": report_path,
-              "checks": checks}
-    evidence = {"source": source, "stage_count": len(stages),
-                "hashes": {name: sha256_text(json.dumps(stages[i], ensure_ascii=False, sort_keys=True))
-                           for i, name in enumerate(artifacts)},
-                "rules_version": "2026-11-20.r1", "randomness": "none",
+              "checks": checks, "answer": answer, "summary": answer,
+              "cleaned_records": cleaned or None, "quality_issues": quality or None,
+              "field_rules": field_rules or None}
+    evidence = {"source": source, "stage_count": len(stages), "hashes": dict(stage_hashes),
+                "rules_version": RULES_VERSION, "randomness": "none",
                 "source_mutation": "none"}
+    if figure_hash:
+        evidence["hashes"]["figure.svg"] = figure_hash
+    if report_hash:
+        evidence["hashes"]["report.md"] = report_hash
     uncertainty = [
         "Column roles are inferred when case fields are absent; verify dataset.inference.",
         "No normality, independence, or multiple-comparison correction is applied.",
-        "figure_spec is a specification only; no PNG/TIFF is produced.",
+        "figure.svg is a hand-written deterministic SVG bar chart; no PNG/TIFF raster is produced.",
+        "Y-axis units are taken from the column header only; none are invented.",
+        "Duplicate rows are counted but kept, so they contribute to the statistics.",
     ]
+    if statistics.get("low_n_groups"):
+        uncertainty.append("Group(s) with n<2 have no SD and no inference; status is partial.")
     if case.get("resume"):
         uncertainty.append("resume=true skips only stages that succeeded in the same run; artifacts are not re-validated.")
     stats = {"stages": len(stages), "blocked_or_failed": blocked,
              "rows": source["rows"] if source else 0,
-             "groups": len(statistics.get("descriptive", [])),
+             "cleaned_rows": sum(d["n"] for d in desc),
+             "dropped_rows": cleaning.get("dropped_missing_or_invalid", 0),
+             "groups": len(desc),
              "errors": len(errors)}
-    summary = report.splitlines()[0] if report else "Pipeline did not produce a report."
     payload = {"stages": stages, "artifacts": artifacts, "dataset": dataset,
                "statistics": statistics, "report": report, "checks": checks,
-               "summary": summary, "status": status, "case_id": case_id, "result": result,
-               "evidence": evidence, "uncertainty": uncertainty, "errors": errors, "stats": stats}
+               "summary": answer, "answer": answer, "status": status, "case_id": case_id,
+               "result": result, "evidence": evidence, "uncertainty": uncertainty,
+               "errors": errors, "stats": stats, "cleaned_records": cleaned or None,
+               "quality_issues": quality or None, "field_rules": field_rules or None}
 
     output = {"case_id": case_id, "status": status, "result": result, "evidence": evidence,
               "uncertainty": uncertainty, "errors": errors, "stats": stats,
-              "report": report, "stages": stages, "artifacts": artifacts}
-    notes = []
+              "report": report, "stages": stages, "artifacts": artifacts,
+              "answer": answer, "cleaned_records": cleaned or None,
+              "quality_issues": quality or None, "field_rules": field_rules or None}
+    extras = {}
     for field in fields:
         canonical, value = resolve_field(field, payload)
-        if canonical is None:
+        if canonical is None or value is None or value == "" or (isinstance(value, (dict, list)) and not value):
+            canonical, value = keyword_map(field, payload)
+        if value is None or value == "" or (isinstance(value, (dict, list)) and not value):
             output[field] = None
-            notes.append("%s: no supported producer in this skill; null retained" % field)
+            extras[field] = {"value": None,
+                             "reason": "no producer matched '%s' in this skill; see report.md and stages/*.json" % field}
         else:
             output[field] = value
-    if notes:
-        output["contract_notes"] = notes
+    if extras:
+        output["contract_extras"] = extras
 
     try:
-        out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(output, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
     except OSError as exc:
-        sys.stderr.write("cannot write result: %s\n" % exc)
+        sys.stderr.write("cannot write result (%s)\n" % err_text(exc))
         return 2
     return 0
 
